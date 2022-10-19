@@ -6,13 +6,16 @@ Copyright {2018} {Viraj Mavani}
        http://www.apache.org/licenses/LICENSE-2.0
 """
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 from tkinter import *
 from tkinter import filedialog
-from PIL import Image, ImageTk
+from PIL import ImageTk
+from PIL import Image
 import keras
 from keras_retinanet import models
 from keras_retinanet.utils.image import preprocess_image
-
+import json
 # import miscellaneous modules
 import os
 import numpy as np
@@ -21,6 +24,9 @@ import config
 import tf_config
 import math
 from pascal_voc_writer import Writer
+import pycocotools
+import copy
+import hashlib
 
 # make sure the file is inside semi-auto-image-annotation-tool-master
 import pathlib
@@ -29,13 +35,47 @@ cur_path = pathlib.Path(__file__).parent.absolute().as_posix()
 sys.path.append(cur_path)
 os.chdir(cur_path)
 
+import detectron2
+from detectron2 import model_zoo
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2.utils.visualizer import Visualizer
+from detectron2.data import MetadataCatalog, DatasetCatalog
+
+
+class Annot:
+    def __init__(self, name, points, annot, rle=None):
+        self.name = name
+        self.rle = rle
+        if rle is None:
+            all_x, all_y = map(list, zip(*points))
+            self.bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
+            self.poly = copy.deepcopy(points)
+        else:
+            self.poly = []
+            self.bbox = list(map(int, points))
+            self.rle['counts'] = self.rle['counts'].decode('utf-8')
+        self.annot = annot
+
+        seg = self.rle
+        if self.rle is None:
+            seg = [[x for t in self.poly for x in t]]
+        self.d = {
+            "bbox": list(self.bbox),
+            "bbox_mode": 0,
+            "segmentation": seg,
+            "category_id": int(self.annot)
+        }
+
+    def __str__(self):
+        return json.dumps(self.d)
+
 
 class MainGUI:
     def __init__(self, master):
 
         # to choose between keras or tensorflow models
-        self.keras_ = 1  # default
-        self.tensorflow_ = 0
+        self.model_type = "keras"
         self.models_dir = ''  # gets updated as per user choice
         self.model_path = ''
         self.parent = master
@@ -44,6 +84,20 @@ class MainGUI:
         self.frame.pack(fill=BOTH, expand=1)
         self.parent.resizable(width=False, height=False)
 
+        cfg = get_cfg()
+        cfg.merge_from_file(model_zoo.get_config_file("Cityscapes/mask_rcnn_R_50_FPN.yaml"))
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.6
+        # cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("Cityscapes/mask_rcnn_R_50_FPN.yaml")
+        cfg.MODEL.WEIGHTS = '/home/linh/repos/cv_bridge_ws/src/detect/output/model_final.pth'
+        self.mask_point_list = []
+        self.mask_done = False
+        self.drawing_artifacts = {}
+        self.cur_drawing = []
+        self.objects_detected = {}
+        self.name_counter = 0
+        self.listbox_to_name = {}
+        self.predictor = DefaultPredictor(cfg)
+        self.labels_to_name_detectron = MetadataCatalog.get("cityscapes_fine_instance_seg_train").thing_classes
         # Initialize class variables
         self.img = None
         self.tkimg = None
@@ -90,6 +144,7 @@ class MainGUI:
         self.annotation_file.write("")
         self.annotation_file.close()
 
+        self.image_path = None
         # ------------------ GUI ---------------------
 
         # Control Panel
@@ -142,7 +197,7 @@ class MainGUI:
         self.zoomcanvas.grid(columnspan=2, sticky=W + E)
 
         # Image Editing Region
-        self.canvas = Canvas(self.frame, width=500, height=500)
+        self.canvas = Canvas(self.frame, width=640, height=500)
         self.canvas.grid(row=0, column=1, sticky=W + N)
         self.canvas.bind("<Button-1>", self.mouse_click)
         self.canvas.bind("<Motion>", self.mouse_move, "+")
@@ -176,7 +231,7 @@ class MainGUI:
         self.textBoxTh.pack(fill=X, side=TOP)
         self.enterthresh = Button(self.listPanel, text="Set", command=self.changeThresh).pack(fill=X, side=TOP)
 
-        if self.keras_:
+        if self.model_type == "keras":
             self.cocoLabels = config.labels_to_names.values()
         else:
             self.cocoLabels = tf_config.labels_to_names.values()
@@ -193,7 +248,7 @@ class MainGUI:
             self.mb1.menu.add_checkbutton(label=modelname, variable=self.modelIntVars[idxmodel])
 
         # STATUS BAR
-        self.statusBar = Frame(self.frame, width=500)
+        self.statusBar = Frame(self.frame, width=640)
         self.statusBar.grid(row=1, column=1, sticky=W + N)
         self.processingLabel = Label(self.statusBar, text="                      ")
         self.processingLabel.pack(side="left", fill=X)
@@ -233,17 +288,21 @@ class MainGUI:
         self.imageDir = filedialog.askdirectory(title="Select Dataset Directory")
         if not self.imageDir:
             return None
+        print(self.imageDir)
         self.imageList = os.listdir(self.imageDir)
         self.imageList = sorted(self.imageList)
         self.imageTotal = len(self.imageList)
         self.filename = None
         self.imageDirPathBuffer = self.imageDir
+        print(len(self.imageList))
+        print(self.cur)
         self.load_image(self.imageDirPathBuffer + '/' + self.imageList[self.cur])
 
     def open_video_file(self):
         pass
 
     def load_image(self, file):
+        self.image_path = file
         self.img = Image.open(file)
         self.imageCur = self.cur + 1
         self.imageIdxLabel.config(text='  ||   Image Number: %d / %d' % (self.imageCur, self.imageTotal))
@@ -251,7 +310,7 @@ class MainGUI:
         w, h = self.img.size
         self.org_w, self.org_h = self.img.size
         if w >= h:
-            baseW = 500
+            baseW = 640
             wpercent = (baseW / float(w))
             hsize = int((float(h) * float(wpercent)))
             self.img = self.img.resize((baseW, hsize), Image.BICUBIC)
@@ -265,8 +324,16 @@ class MainGUI:
         self.canvas.create_image(0, 0, image=self.tkimg, anchor=NW)
         self.clear_bbox()
 
+    def reset(self):
+        self.drawing_artifacts = {}
+        self.objects_detected = {}
+        self.listbox_to_name = {}
+        self.mask_point_list = []
+        self.name_counter = 0
+
     def open_next(self, event=None):
-        self.save()
+        self.reset()
+        # self.save()
         if self.cur < len(self.imageList):
             self.cur += 1
             self.load_image(self.imageDirPathBuffer + '/' + self.imageList[self.cur])
@@ -276,7 +343,8 @@ class MainGUI:
             self.automate()
 
     def open_previous(self, event=None):
-        self.save()
+        # self.save()
+        self.reset()
         if self.cur > 0:
             self.cur -= 1
             self.load_image(self.imageDirPathBuffer + '/' + self.imageList[self.cur])
@@ -286,41 +354,25 @@ class MainGUI:
             self.automate()
 
     def save(self):
-        if self.filenameBuffer is None:
-            w, h = self.img.size
-            self.writer = Writer(os.path.join(self.imageDirPathBuffer , self.imageList[self.cur]), w, h)
-            self.annotation_file = open('annotations/' + self.anno_filename, 'a')
-            for idx, item in enumerate(self.bboxList):
-                x1, y1, x2, y2 = self.bboxList[idx]
-                self.writer.addObject(str(self.objectLabelList[idx]), x1, y1, x2, y2)
-                self.annotation_file.write(self.imageDirPathBuffer + '/' + self.imageList[self.cur] + ',' +
-                                           ','.join(map(str, self.bboxList[idx])) + ',' + str(self.objectLabelList[idx])
-                                           + '\n')
-            self.annotation_file.close()
-            baseName = os.path.splitext(self.imageList[self.cur])[0]
-            save_dir = 'annotations/annotations_voc/'
-            save_path = save_dir + baseName + '.xml'
-            if(not os.path.exists(save_dir)):
-                os.mkdir(save_dir)
+        w, h = self.img.size
+        im_id = hashlib.md5(self.image_path.encode()).hexdigest()
+        im_dict = {
+            'file_name': self.image_path,
+            'height': h,
+            'width': w,
+            'image_id': im_id,
+            'annotations': [x.d for x in self.objects_detected.values()]
+        }
+        file_name = os.path.join('coco_annot', str(im_id) + '.json')
+        with open(file_name, 'w') as write_file:
+            json.dump(im_dict, write_file)
 
-            self.writer.save(save_path)
-            self.writer = None
-        else:
-            w, h = self.img.size
-            self.writer = Writer(self.filenameBuffer, w, h)
-            self.annotation_file = open('annotations/' + self.anno_filename, 'a')
-            for idx, item in enumerate(self.bboxList):
-                x1, y1, x2, y2 = self.bboxList[idx]
-                self.writer.addObject(str(self.objectLabelList[idx]), x1, y1, x2, y2)
-                self.annotation_file.write(self.filenameBuffer + ',' + ','.join(map(str, self.bboxList[idx])) + ','
-                                           + str(self.objectLabelList[idx]) + '\n')
-            self.annotation_file.close()
-            baseName = os.path.splitext(self.imageList[self.cur])[0]
-            self.writer.save('annotations/annotations_voc/' + baseName + '.xml')
-            self.writer = None
+    def close_enough(self, p1, p2):
+        return abs(p1[0] - p2[0]) < 5 and abs(p1[1] - p2[1]) < 5
 
     def mouse_click(self, event):
         # Check if Updating BBox
+        return
         if self.canvas.find_enclosed(event.x - 5, event.y - 5, event.x + 5, event.y + 5):
             self.EDIT = True
             self.editPointId = int(self.canvas.find_enclosed(event.x - 5, event.y - 5, event.x + 5, event.y + 5)[0])
@@ -352,6 +404,7 @@ class MainGUI:
 
     def mouse_drag(self, event):
         self.mouse_move(event)
+        return
         if self.bboxId:
             self.currBboxColor = self.canvas.itemcget(self.bboxId, "outline")
             self.canvas.delete(self.bboxId)
@@ -385,33 +438,57 @@ class MainGUI:
             # elif (event.x, event.y) in self.bboxBRPointList:
             #     pass
 
+    def print_poly(self):
+        s = '(%d, %d) -> .. %d .. -> (%d, %d)' % (self.mask_point_list[0][0],
+                                                  self.mask_point_list[0][1],
+                                                  len(self.mask_point_list),
+                                                  self.mask_point_list[-1][0],
+                                                  self.mask_point_list[-1][1])
+        return s
+
     def mouse_release(self, event):
         try:
             labelidx = self.labelListBox.curselection()
             self.currLabel = self.labelListBox.get(labelidx)
+            idx = labelidx[0]
         except:
+            idx = None
             pass
         if self.EDIT:
-            self.update_bbox()
             self.EDIT = False
-        x1, x2 = min(self.STATE['x'], event.x), max(self.STATE['x'], event.x)
-        y1, y2 = min(self.STATE['y'], event.y), max(self.STATE['y'], event.y)
-        self.bboxList.append((x1, y1, x2, y2))
+        x1 = event.x
+        y1 = event.y
         o1 = self.canvas.create_oval(x1 - 3, y1 - 3, x1 + 3, y1 + 3, fill="red")
-        o2 = self.canvas.create_oval(x2 - 3, y1 - 3, x2 + 3, y1 + 3, fill="red")
-        o3 = self.canvas.create_oval(x2 - 3, y2 - 3, x2 + 3, y2 + 3, fill="red")
-        o4 = self.canvas.create_oval(x1 - 3, y2 - 3, x1 + 3, y2 + 3, fill="red")
         self.bboxPointList.append(o1)
-        self.bboxPointList.append(o2)
-        self.bboxPointList.append(o3)
-        self.bboxPointList.append(o4)
-        self.bboxIdList.append(self.bboxId)
-        self.bboxId = None
-        self.objectLabelList.append(str(self.currLabel))
-        self.objectListBox.insert(END, '(%d, %d) -> (%d, %d)' % (x1, y1, x2, y2) + ': ' + str(self.currLabel))
-        self.objectListBox.itemconfig(len(self.bboxIdList) - 1,
-                                      fg=self.currBboxColor)
-        self.currLabel = None
+        if len(self.mask_point_list) == 0:
+            self.mask_point_list.append((event.x, event.y))
+            self.mask_done = False
+            self.cur_drawing.append(o1)
+        else:
+            if not self.close_enough(self.mask_point_list[0], (event.x, event.y)):
+                self.mask_point_list.append((event.x, event.y))
+                line = self.canvas.create_line(self.mask_point_list[-2][0], self.mask_point_list[-2][1],
+                                        self.mask_point_list[-1][0], self.mask_point_list[-1][1], width=2)
+                self.cur_drawing.append(o1)
+                self.cur_drawing.append(line)
+            else:
+                line = self.canvas.create_line(self.mask_point_list[-1][0], self.mask_point_list[-1][1],
+                                        self.mask_point_list[0][0], self.mask_point_list[0][1], width=2)
+                self.cur_drawing.append(o1)
+                self.cur_drawing.append(line)
+                print("Done")
+                print(self.mask_point_list)
+                self.objectLabelList.append(str(self.currLabel))
+                self.objectListBox.insert(END, self.print_poly() + ': ' + str(self.currLabel))
+                self.listbox_to_name[self.objectListBox.size() - 1] = self.name_counter
+                annot = Annot(str(self.name_counter), self.mask_point_list, idx)
+                self.objects_detected[self.name_counter] = annot
+                self.drawing_artifacts[self.name_counter] = copy.deepcopy(self.cur_drawing)
+                self.name_counter += 1
+                self.currLabel = None
+                self.mask_point_list = []
+                self.mask_done = True
+                self.cur_drawing = []
 
     def zoom_view(self, event):
         try:
@@ -456,19 +533,18 @@ class MainGUI:
         if len(sel) != 1:
             return
         idx = int(sel[0])
-        self.canvas.delete(self.bboxIdList[idx])
-        self.canvas.delete(self.bboxPointList[idx * 4])
-        self.canvas.delete(self.bboxPointList[(idx * 4) + 1])
-        self.canvas.delete(self.bboxPointList[(idx * 4) + 2])
-        self.canvas.delete(self.bboxPointList[(idx * 4) + 3])
-        self.bboxPointList.pop(idx * 4)
-        self.bboxPointList.pop(idx * 4)
-        self.bboxPointList.pop(idx * 4)
-        self.bboxPointList.pop(idx * 4)
-        self.bboxIdList.pop(idx)
-        self.bboxList.pop(idx)
+        art_idx = self.listbox_to_name[idx]
+        for art in self.drawing_artifacts[art_idx]:
+            self.canvas.delete(art)
+        self.objects_detected.pop(art_idx)
         self.objectLabelList.pop(idx)
         self.objectListBox.delete(idx)
+        self.listbox_to_name.pop(idx)
+        remaining = sorted(self.listbox_to_name.keys())
+        replace = {}
+        for idx, k in enumerate(remaining):
+            replace[idx] = self.listbox_to_name[k]
+        self.listbox_to_name = replace
 
     def clear_bbox(self):
         for idx in range(len(self.bboxIdList)):
@@ -480,6 +556,12 @@ class MainGUI:
         self.bboxList = []
         self.objectLabelList = []
         self.bboxPointList = []
+        self.listbox_to_name = {}
+        self.objects_detected = {}
+        self.mask_point_list = []
+        for item in self.drawing_artifacts.values():
+            for i in item:
+                self.canvas.delete(i)
 
     def add_label(self):
         if self.textBox.get() is not '':
@@ -500,14 +582,15 @@ class MainGUI:
                 self.model_path = os.path.join(self.models_dir,list_model_name)
                 # if its Tensorflow model then modify path
                 if('keras' in list_model_name):
-                    self.keras_ = 1
-                    self.tensorflow_ = 0
+                    self.model_type = "keras"
                 elif('tensorflow' in list_model_name):
                     self.model_path = os.path.join(self.model_path,'frozen_inference_graph.pb')
-                    self.keras_ = 0
-                    self.tensorflow_ = 1
+                    self.model_type = "tensorflow"
                     # change cocoLabels corresponding to tensorflow
                     self.cocoLabels = tf_config.labels_to_names.values()
+                elif 'torch' in list_model_name:
+                    self.model_type = "torch"
+                    self.model_path = os.path.join(self.models_dir, list_model_name)
                 break
 
 
@@ -520,7 +603,8 @@ class MainGUI:
                     self.labelListBox.insert(END, str(list_label_coco))
 
     def add_all_classes(self):
-        for listidxcoco, list_label_coco in enumerate(self.cocoLabels):
+        for listidxcoco, list_label_coco in enumerate(self.labels_to_name_detectron):
+            # enumerate(self.cocoLabels):
             # if self.cocoIntVars[listidxcoco].get():
             curr_label_list = self.labelListBox.get(0, END)
             curr_label_list = list(curr_label_list)
@@ -533,40 +617,19 @@ class MainGUI:
         open_cv_image = np.array(self.img)
         # Convert RGB to BGR
         opencvImage = open_cv_image[:, :, ::-1].copy()
-        # if tensorflow
-        if self.tensorflow_ :
-            detection_graph = tf.Graph()
-            with detection_graph.as_default():
-                od_graph_def = tf.GraphDef()
-                with tf.gfile.GFile(self.model_path, 'rb') as fid:
-                    serialized_graph = fid.read()
-                    od_graph_def.ParseFromString(serialized_graph)
-                    tf.import_graph_def(od_graph_def, name='')
-
-                sess = tf.Session(graph=detection_graph)
-
-            image_tensor = detection_graph.get_tensor_by_name('image_tensor:0')
-            detection_boxes = detection_graph.get_tensor_by_name('detection_boxes:0')
-            detection_scores = detection_graph.get_tensor_by_name('detection_scores:0')
-            detection_classes = detection_graph.get_tensor_by_name('detection_classes:0')
-            num_detections = detection_graph.get_tensor_by_name('num_detections:0')
-
-            image_expanded = np.expand_dims(opencvImage, axis=0)
-            (boxes, scores, labels, num) = sess.run(
-            [detection_boxes, detection_scores, detection_classes, num_detections],
-            feed_dict={image_tensor: image_expanded})
-            config_labels = tf_config.labels_to_names
-            m_name = os.path.split((os.path.split(self.model_path)[0]))[1]
-
-        else:
-            keras.backend.tensorflow_backend.set_session(self.get_session())
-            model_path = self.model_path
-            model = models.load_model(model_path, backbone_name='resnet50')
-            image = preprocess_image(opencvImage)
-            boxes, scores, labels = model.predict_on_batch(np.expand_dims(image, axis=0))
-            config_labels = config.labels_to_names
-            m_name = os.path.split(self.model_path)[1]
-        for idx, (box, label, score) in enumerate(zip(boxes[0], labels[0], scores[0])):
+        outputs = self.predictor(opencvImage)
+        inst = outputs["instances"].to("cpu")
+        if not inst.has("pred_masks"):
+            print("No detected objects")
+            self.processingLabel.config(text="None detected       ")
+            return
+        boxes = inst.pred_boxes.tensor.numpy()
+        labels = inst.pred_classes.numpy()
+        scores = inst.scores.numpy()
+        masks = inst.pred_masks.numpy()
+        m_name = "Detectron2"
+        config_labels = self.labels_to_name_detectron
+        for idx, (box, label, score, m) in enumerate(zip(boxes, labels, scores, masks)):
             curr_label_list = self.labelListBox.get(0, END)
             curr_label_list = list(curr_label_list)
             if score < self.thresh:
@@ -577,7 +640,7 @@ class MainGUI:
 
             b = box
             # only if using tf models as keras and tensorflow have different coordinate order
-            if(self.tensorflow_):
+            if(self.model_type == "tensorflow"):
                 w, h = self.img.size
                 (b[0],b[1],b[2],b[3]) = (b[1]*w, b[0]*h, b[3]*w, b[2]*h)
             b = b.astype(int)
@@ -590,18 +653,21 @@ class MainGUI:
             o2 = self.canvas.create_oval(b[2] - 3, b[1] - 3, b[2] + 3, b[1] + 3, fill="red")
             o3 = self.canvas.create_oval(b[2] - 3, b[3] - 3, b[2] + 3, b[3] + 3, fill="red")
             o4 = self.canvas.create_oval(b[0] - 3, b[3] - 3, b[0] + 3, b[3] + 3, fill="red")
-            self.bboxPointList.append(o1)
-            self.bboxPointList.append(o2)
-            self.bboxPointList.append(o3)
-            self.bboxPointList.append(o4)
+            self.objectLabelList.append(str(config_labels[label]))
+            self.drawing_artifacts[self.name_counter] = [o1, o2, o3, o4, self.bboxId]
+            rle = pycocotools.mask.encode(np.asarray(m, order="F"))
+            annot = Annot(str(self.name_counter), self.bboxList[-1], label, rle)
+            self.objects_detected[self.name_counter] = annot
             self.bboxIdList.append(self.bboxId)
             self.bboxId = None
-            self.objectLabelList.append(str(config_labels[label]))
             self.objectListBox.insert(END, '(%d, %d) -> (%d, %d)' % (b[0], b[1], b[2], b[3]) + ': ' +
                                   str(config_labels[label])+' '+str(int(score*100))+'%'
                                       +' '+ m_name)
+            self.listbox_to_name[self.objectListBox.size() - 1] = self.name_counter
             self.objectListBox.itemconfig(len(self.bboxIdList) - 1,
                                           fg=config.COLORS[(len(self.bboxIdList) - 1) % len(config.COLORS)])
+            self.name_counter += 1
+
         self.processingLabel.config(text="Done              ")
 
 
